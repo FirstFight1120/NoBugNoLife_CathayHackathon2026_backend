@@ -1,0 +1,19 @@
+[project]
+name = "nbnl-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "FirstFight", email = "hiuleongcai@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.143.0",
+]
+
+[project.scripts]
+nbnl-backend = "nbnl_backend:main"
+
+[build-system]
+requires = ["uv_build>=0.12.24,<0.13.0"]
+build-backend = "uv_build"
