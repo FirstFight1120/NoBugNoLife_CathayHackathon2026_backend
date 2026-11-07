@@ -165,6 +165,7 @@ class Flight(Base):
     actual_zfw: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
     planned_ldw: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
     planned_tow: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
+    usable_capacity_kg: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
 
     aircraft_aircraft: Mapped['Aircraft'] = relationship('Aircraft', back_populates='flight')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='flight_flight')
@@ -193,6 +194,8 @@ class AwbUldFlight(Base):
     risk_level: Mapped[Optional[str]] = mapped_column(String(20))
     risk_types: Mapped[Optional[object]] = mapped_column(JSONB)
     risk_reasons: Mapped[Optional[object]] = mapped_column(JSONB)
+    forecast_timestamp: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+    forecast_confidence: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(3, 2))
 
     awb: Mapped['Awb'] = relationship('Awb', back_populates='awb_uld_flight')
     flight_flight: Mapped['Flight'] = relationship('Flight', back_populates='awb_uld_flight')

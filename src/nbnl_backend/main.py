@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends
+from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from collections import defaultdict
 import math
@@ -9,6 +9,7 @@ from src.nbnl_backend import models, schemas
 app = FastAPI(title="Cathay Cargo API")
 router = APIRouter()
 
+# 1st API endpoint: Prevention Plans
 @router.get("/api/v1/prevention-plans", response_model=schemas.PreventionPlanResponse)
 def get_prevention_plans(page: int = 1, limit: int = 20, db: Session = Depends(get_db)):
     
@@ -117,4 +118,115 @@ def get_prevention_plans(page: int = 1, limit: int = 20, db: Session = Depends(g
         )
     )
 
+
+# 2nd API endpoint: Flight Details
+@router.get("/api/v1/prevention-plans/{flight_id}", response_model=schemas.FlightDetailsResponse)
+def get_flight_details(flight_id: str, db: Session = Depends(get_db)):
+    # 1. Fetch the Flight and Aircraft details
+    flight = db.query(models.Flight).options(
+        joinedload(models.Flight.aircraft_aircraft)
+    ).filter(models.Flight.flight_id == flight_id).first()
+
+    if not flight:
+        raise HTTPException(status_code=404, detail="Flight not found")
+
+    # 2. Fetch all AWB_ULD_FLIGHT records for this flight
+    manifest_items = db.query(models.AwbUldFlight).options(
+        joinedload(models.AwbUldFlight.awb).joinedload(models.Awb.shipment),
+        joinedload(models.AwbUldFlight.uld)
+    ).filter(models.AwbUldFlight.flight_flight_id == flight_id).all()
+
+    # 3. Calculate Capacity Metrics
+    usable_capacity = float(flight.usable_capacity_kg) if flight.usable_capacity_kg else float(flight.aircraft_aircraft.max_payload_weight or 0.0)
+    booked_weight = sum(float(item.weight) for item in manifest_items if item.weight)
+    booked_volume = sum(float(item.volume) for item in manifest_items if item.volume)
+    remaining_capacity = usable_capacity - booked_weight
+
+    # 4. Build Affected Shipments List & Determine Overall Risk
+    affected_shipments = []
+    max_risk_prob = 0.0
+    overall_risk_level = "Low"
+    primary_reason = ""
+    forecast_timestamp = None
+    forecast_confidence = 0.0
+    
+    for item in manifest_items:
+        if item.offload_probability:
+            prob = float(item.offload_probability)
+            if prob > max_risk_prob:
+                max_risk_prob = prob
+                overall_risk_level = item.risk_level or "Moderate"
+                forecast_timestamp = item.forecast_timestamp
+                forecast_confidence = float(item.forecast_confidence) if item.forecast_confidence else 0.0
+
+                if item.risk_reasons and isinstance(item.risk_reasons, list):
+                    if len(item.risk_reasons) > 0:
+                        primary_reason = str(item.risk_reasons[0])
+
+
+        for shipment in item.awb.shipment:
+            customer_name = shipment.shipper.comp_name if shipment.shipper else "Unknown"
+            
+            priority_enum = "Standard"
+            if item.awb.priority_score:
+                if float(item.awb.priority_score) >= 90:
+                    priority_enum = "Critical"
+                elif float(item.awb.priority_score) >= 70:
+                    priority_enum = "High"
+
+            # Note: Using snake_case here. Pydantic will convert to camelCase in the response.
+            affected_shipments.append({
+                "shipment_id": shipment.s_no,
+                "customer": customer_name,
+                "origin": item.awb.origin,
+                "destination": item.awb.dest,
+                "weight_kg": float(item.weight) if item.weight else 0.0,
+                "volume_m3": float(item.volume) if item.volume else 0.0,
+                "priority": priority_enum,
+                "delivery_deadline": item.awb.contract_ddl.isoformat() + "Z" if item.awb.contract_ddl else None,
+                "offload_probability": float(item.offload_probability) if item.offload_probability else 0.0,
+                "value_at_risk": float(item.awb.declared_value) if item.awb.declared_value else 0.0
+            })
+
+    status = "PREVENTIVE_ACTION_REQUIRED" if max_risk_prob >= 0.50 else "AT_RISK"
+    if max_risk_prob == 0.0:
+        status = "REVIEWED"
+
+    # 5. Construct the final response (Using snake_case keys)
+    return {
+        "plan_id": f"PP-{flight.flight_no}-{flight.std.strftime('%Y%m%d') if flight.std else '20261016'}",
+        "currency": "HKD",
+        "flight": {
+            "flight_id": flight.flight_no,
+            "origin": flight.origin,
+            "destination": flight.dest,
+            "scheduled_departure": flight.std.isoformat() + "Z" if flight.std else None,
+            "aircraft_type": flight.aircraft_aircraft.aircraft_type
+        },
+        "review": {
+            "status": status,
+            "risk_level": overall_risk_level,
+            "reason": primary_reason or "No current risk detected",
+            "forecast_timestamp": forecast_timestamp.isoformat() + "Z" if forecast_timestamp else "2026-10-16T09:10:00Z",
+            "forecast_confidence": forecast_confidence
+        },
+        "capacity": {
+            "usable_capacity_kg": usable_capacity,
+            "booked_weight_kg": booked_weight,
+            "remaining_capacity_kg": remaining_capacity,
+            "booked_volume_m3": booked_volume
+        },
+        "affected_shipments": affected_shipments,
+        "assumptions": [
+            "Approved payload is based on operational capacity.",
+            "Weather impact remains forecast evidence.",
+            "Partner capacity requires operational confirmation.",
+            "Connecting flights are tracked as independent flight records."
+        ]
+    }
+
 app.include_router(router)
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "API is running"}
