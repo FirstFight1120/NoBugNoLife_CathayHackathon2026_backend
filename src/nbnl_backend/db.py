@@ -1,22 +1,20 @@
 import os
-from sqlalchemy import URL, create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
-load_dotenv() # Load variables from .env
+# Docker will inject this directly. 
+# For local running, main.py will load the .env file.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DATABASE_URL: str | URL | None = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is not set")
+    raise ValueError("DATABASE_URL environment variable is not set!")
 
-# Create the SQLAlchemy engine
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL, 
+    connect_args={"options": "-c statement_cache_capacity=0"} # Critical for Supabase
+)
 
-# Create a session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Base class for your models
-Base = declarative_base()
 
 def get_db():
     db = SessionLocal()

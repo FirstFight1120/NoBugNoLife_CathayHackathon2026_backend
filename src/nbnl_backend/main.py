@@ -1,12 +1,33 @@
+from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
+from apscheduler.schedulers.background import BackgroundScheduler
+
+
 from collections import defaultdict
 import math
 
 from src.nbnl_backend.db import get_db
 from src.nbnl_backend import models, schemas
+from src.nbnl_backend.bg_tasks_pri_risk import run_batch_update_job
 
-app = FastAPI(title="Cathay Cargo API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Startup: Initialize and start the scheduler
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(run_batch_update_job, 'interval', minutes=15, next_run_time=datetime.now())
+    scheduler.start()
+    print("Background job scheduler started.")
+    
+    yield  # The application runs here
+    
+    # 2. Shutdown: Gracefully stop the scheduler
+    scheduler.shutdown()
+    print("Background job scheduler stopped.")
+
+app = FastAPI(title="Cathay Cargo API", lifespan=lifespan)
 router = APIRouter()
 
 # 1st API endpoint: Prevention Plans
@@ -81,7 +102,7 @@ def get_prevention_plans(page: int = 1, limit: int = 20, db: Session = Depends(g
         # If the average is >= 80%, flag for offload
         if avg_risk >= 0.80:
             total_shipments_at_risk += len(data["at_risk_awbs"])
-            
+                 
             item = schemas.PreventionPlanItem(
                 flight_id=data["flight_id"],
                 target_uld_no=data["target_uld_no"],

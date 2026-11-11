@@ -1,0 +1,10 @@
+services:
+  api:
+    build: .
+    container_name: cathay_cargo_api
+    ports:
+      - "8000:8000"
+    environment:
+      # Docker will automatically read DATABASE_URL from your .env file
+      - DATABASE_URL=${DATABASE_URL}
+    restart: unless-stopped

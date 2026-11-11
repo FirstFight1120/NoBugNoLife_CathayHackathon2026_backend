@@ -2,7 +2,7 @@ from typing import Optional
 import datetime
 import decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKeyConstraint, Identity, Index, Integer, Numeric, PrimaryKeyConstraint, String, UniqueConstraint, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKeyConstraint, Identity, Index, Integer, Numeric, PrimaryKeyConstraint, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -24,6 +24,7 @@ class Awb(Base):
     contract_ddl: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
     declared_value: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(15, 2))
     ttl_piece: Mapped[Optional[int]] = mapped_column(Integer)
+    priority_calculated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
 
     shipment: Mapped[list['Shipment']] = relationship('Shipment', back_populates='awb')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='awb')
@@ -140,7 +141,9 @@ class Uld(Base):
 
     loadtype_loadtype: Mapped['Loadtype'] = relationship('Loadtype', back_populates='uld')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='uld')
+    offload: Mapped[list['Offload']] = relationship('Offload', back_populates='uld')
     uld_flight: Mapped[list['UldFlight']] = relationship('UldFlight', back_populates='uld')
+    recovery_plan: Mapped[list['RecoveryPlan']] = relationship('RecoveryPlan', back_populates='uld')
 
 
 class Flight(Base):
@@ -169,7 +172,10 @@ class Flight(Base):
 
     aircraft_aircraft: Mapped['Aircraft'] = relationship('Aircraft', back_populates='flight')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='flight_flight')
+    offload: Mapped[list['Offload']] = relationship('Offload', back_populates='flight')
     uld_flight: Mapped[list['UldFlight']] = relationship('UldFlight', back_populates='flight_flight')
+    recovery_plan_proposed_flight: Mapped[list['RecoveryPlan']] = relationship('RecoveryPlan', foreign_keys='[RecoveryPlan.proposed_flight_id]', back_populates='proposed_flight')
+    recovery_plan_swap_original_flight: Mapped[list['RecoveryPlan']] = relationship('RecoveryPlan', foreign_keys='[RecoveryPlan.swap_original_flight_id]', back_populates='swap_original_flight')
 
 
 class AwbUldFlight(Base):
@@ -202,6 +208,26 @@ class AwbUldFlight(Base):
     uld: Mapped['Uld'] = relationship('Uld', back_populates='awb_uld_flight')
 
 
+class Offload(Base):
+    __tablename__ = 'offload'
+    __table_args__ = (
+        CheckConstraint("source_type::text = ANY (ARRAY['Disrupted'::character varying, 'Predicted'::character varying, 'Displaced'::character varying]::text[])", name='chk_source_type'),
+        ForeignKeyConstraint(['flight_id'], ['flight.flight_id'], name='fk_offload_flight'),
+        ForeignKeyConstraint(['uld_no'], ['uld.uld_no'], name='fk_offload_uld'),
+        PrimaryKeyConstraint('offload_id', name='offload_pkey')
+    )
+
+    offload_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    uld_no: Mapped[str] = mapped_column(String(12), nullable=False)
+    flight_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('CURRENT_TIMESTAMP'))
+
+    flight: Mapped['Flight'] = relationship('Flight', back_populates='offload')
+    uld: Mapped['Uld'] = relationship('Uld', back_populates='offload')
+    recovery_plan: Mapped[list['RecoveryPlan']] = relationship('RecoveryPlan', back_populates='offload')
+
+
 class UldFlight(Base):
     __tablename__ = 'uld_flight'
     __table_args__ = (
@@ -218,3 +244,30 @@ class UldFlight(Base):
 
     flight_flight: Mapped['Flight'] = relationship('Flight', back_populates='uld_flight')
     uld: Mapped['Uld'] = relationship('Uld', back_populates='uld_flight')
+
+
+class RecoveryPlan(Base):
+    __tablename__ = 'recovery_plan'
+    __table_args__ = (
+        CheckConstraint("plan_type::text = ANY (ARRAY['Replacement_From_Pool'::character varying, 'Swap_Same_Dest'::character varying, 'Rebook'::character varying]::text[])", name='chk_plan_type'),
+        CheckConstraint("status::text = ANY (ARRAY['Pending'::character varying, 'Approved'::character varying, 'Denied'::character varying]::text[])", name='chk_plan_status'),
+        ForeignKeyConstraint(['offload_id'], ['offload.offload_id'], name='fk_plan_offload'),
+        ForeignKeyConstraint(['proposed_flight_id'], ['flight.flight_id'], name='fk_plan_proposed_flight'),
+        ForeignKeyConstraint(['swap_original_flight_id'], ['flight.flight_id'], name='fk_plan_swap_flight'),
+        ForeignKeyConstraint(['swap_uld_no'], ['uld.uld_no'], name='fk_plan_swap_uld'),
+        PrimaryKeyConstraint('plan_id', name='recovery_plan_pkey')
+    )
+
+    plan_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    offload_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    plan_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    proposed_flight_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[Optional[str]] = mapped_column(String(20), server_default=text("'Pending'::character varying"))
+    estimated_priority_score: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(4, 2))
+    swap_uld_no: Mapped[Optional[str]] = mapped_column(String(12))
+    swap_original_flight_id: Mapped[Optional[str]] = mapped_column(String(50))
+
+    offload: Mapped['Offload'] = relationship('Offload', back_populates='recovery_plan')
+    proposed_flight: Mapped['Flight'] = relationship('Flight', foreign_keys=[proposed_flight_id], back_populates='recovery_plan_proposed_flight')
+    swap_original_flight: Mapped[Optional['Flight']] = relationship('Flight', foreign_keys=[swap_original_flight_id], back_populates='recovery_plan_swap_original_flight')
+    uld: Mapped[Optional['Uld']] = relationship('Uld', back_populates='recovery_plan')
