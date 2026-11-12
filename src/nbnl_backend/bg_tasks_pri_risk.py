@@ -1,7 +1,7 @@
 # src/nbnl_backend/tasks.py
 import random
 import datetime
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, selectinload
 from src.nbnl_backend import models
 from src.nbnl_backend.db import SessionLocal
 
@@ -46,17 +46,17 @@ def mock_ml_risk_score(awb_no: str, uld_no: str, flight_id: str) -> float:
     return round(random.uniform(0.0, 1.0), 2)
 
 def run_batch_update_job():
+    print("🚀 STARTING BATCH UPDATE JOB...")
     db: Session = SessionLocal()
     batch_size = 500
     updated_awb_count = 0
-    updated_auf_count = 0
 
     try:
-        # Update AWB Priority
+        # 1. Update AWB Priority Scores
         awb_query = db.query(models.Awb)\
             .join(models.Awb.awb_uld_flight)\
             .join(models.AwbUldFlight.flight_flight)\
-            .options(joinedload(models.Awb.shipment))\
+            .options(selectinload(models.Awb.shipment))\
             .filter(models.Flight.std > datetime.datetime.now())\
             .distinct(models.Awb.awb_no)\
             .yield_per(batch_size)
@@ -64,7 +64,11 @@ def run_batch_update_job():
         awb_updates = []
         for awb in awb_query:
             priority = calculate_awb_priority_score(awb)
-            awb_updates.append({"awb_no": awb.awb_no, "priority_score": priority})
+            awb_updates.append({
+                "awb_no": awb.awb_no, 
+                "priority_score": priority,
+                "priority_calculated_at": datetime.datetime.now()
+            })
 
             if len(awb_updates) >= batch_size:
                 db.bulk_update_mappings(models.Awb, awb_updates)
@@ -77,15 +81,13 @@ def run_batch_update_job():
             db.commit()
             updated_awb_count += len(awb_updates)
 
-        print(f"[{datetime.datetime.now()}] Priority scores updated for {updated_awb_count} AWBs.")
+        print(f"✅ Priority scores updated for {updated_awb_count} AWBs.")
 
-        # Update Risk Scores
-        auf_query = db.query(models.AwbUldFlight)\
-            .join(models.Flight, models.AwbUldFlight.flight_flight_id == models.Flight.flight_id)\
-            .filter(models.Flight.std > datetime.datetime.now())\
-            .yield_per(batch_size)
-
+        # 2. Update AWB_ULD_FLIGHT Risk Scores (No change needed here)
+        auf_query = db.query(models.AwbUldFlight).yield_per(batch_size)
         auf_updates = []
+        updated_auf_count = 0
+
         for record in auf_query:
             risk = mock_ml_risk_score(record.awb_awb_no, record.uld_uld_no, record.flight_flight_id)
             auf_updates.append({
@@ -106,11 +108,11 @@ def run_batch_update_job():
             db.commit()
             updated_auf_count += len(auf_updates)
 
-        print(f"[{datetime.datetime.now()}] Risk scores updated for {updated_auf_count} AWB_ULD_FLIGHT records.")
+        print(f"✅ Risk scores updated for {updated_auf_count} AWB_ULD_FLIGHT records.")
 
     except Exception as e:
         db.rollback()
-        print(f"Batch job failed: {e}")
+        print(f"❌ BATCH JOB FAILED: {e}")
     finally:
         db.close()
 

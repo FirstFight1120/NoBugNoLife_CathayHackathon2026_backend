@@ -2,8 +2,8 @@ from typing import Optional
 import datetime
 import decimal
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKeyConstraint, Identity, Index, Integer, Numeric, PrimaryKeyConstraint, String, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, DateTime, Double, ForeignKeyConstraint, Identity, Index, Integer, Numeric, PrimaryKeyConstraint, String, Table, Text, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import JSONB, OID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
@@ -17,7 +17,7 @@ class Awb(Base):
     )
 
     awb_no: Mapped[str] = mapped_column(String(12), primary_key=True)
-    priority_score: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(4, 2))
+    priority_score: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(5, 2))
     origin: Mapped[Optional[str]] = mapped_column(String(30))
     dest: Mapped[Optional[str]] = mapped_column(String(30))
     issued_date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
@@ -25,8 +25,11 @@ class Awb(Base):
     declared_value: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(15, 2))
     ttl_piece: Mapped[Optional[int]] = mapped_column(Integer)
     priority_calculated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+    is_delayed_by_customer: Mapped[Optional[bool]] = mapped_column(Boolean, server_default=text('false'))
+    document_version: Mapped[Optional[int]] = mapped_column(Integer, server_default=text('1'))
 
     shipment: Mapped[list['Shipment']] = relationship('Shipment', back_populates='awb')
+    recovery_decision: Mapped[list['RecoveryDecision']] = relationship('RecoveryDecision', back_populates='awb')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='awb')
 
 
@@ -77,6 +80,67 @@ class Loadtype(Base):
     allowed_aircraft: Mapped[Optional[str]] = mapped_column(String(50))
 
     uld: Mapped[list['Uld']] = relationship('Uld', back_populates='loadtype_loadtype')
+
+
+t_pg_stat_statements = Table(
+    'pg_stat_statements', Base.metadata,
+    Column('userid', OID),
+    Column('dbid', OID),
+    Column('toplevel', Boolean),
+    Column('queryid', BigInteger),
+    Column('query', Text),
+    Column('plans', BigInteger),
+    Column('total_plan_time', Double(53)),
+    Column('min_plan_time', Double(53)),
+    Column('max_plan_time', Double(53)),
+    Column('mean_plan_time', Double(53)),
+    Column('stddev_plan_time', Double(53)),
+    Column('calls', BigInteger),
+    Column('total_exec_time', Double(53)),
+    Column('min_exec_time', Double(53)),
+    Column('max_exec_time', Double(53)),
+    Column('mean_exec_time', Double(53)),
+    Column('stddev_exec_time', Double(53)),
+    Column('rows', BigInteger),
+    Column('shared_blks_hit', BigInteger),
+    Column('shared_blks_read', BigInteger),
+    Column('shared_blks_dirtied', BigInteger),
+    Column('shared_blks_written', BigInteger),
+    Column('local_blks_hit', BigInteger),
+    Column('local_blks_read', BigInteger),
+    Column('local_blks_dirtied', BigInteger),
+    Column('local_blks_written', BigInteger),
+    Column('temp_blks_read', BigInteger),
+    Column('temp_blks_written', BigInteger),
+    Column('shared_blk_read_time', Double(53)),
+    Column('shared_blk_write_time', Double(53)),
+    Column('local_blk_read_time', Double(53)),
+    Column('local_blk_write_time', Double(53)),
+    Column('temp_blk_read_time', Double(53)),
+    Column('temp_blk_write_time', Double(53)),
+    Column('wal_records', BigInteger),
+    Column('wal_fpi', BigInteger),
+    Column('wal_bytes', Numeric),
+    Column('jit_functions', BigInteger),
+    Column('jit_generation_time', Double(53)),
+    Column('jit_inlining_count', BigInteger),
+    Column('jit_inlining_time', Double(53)),
+    Column('jit_optimization_count', BigInteger),
+    Column('jit_optimization_time', Double(53)),
+    Column('jit_emission_count', BigInteger),
+    Column('jit_emission_time', Double(53)),
+    Column('jit_deform_count', BigInteger),
+    Column('jit_deform_time', Double(53)),
+    Column('stats_since', DateTime(True)),
+    Column('minmax_stats_since', DateTime(True))
+)
+
+
+t_pg_stat_statements_info = Table(
+    'pg_stat_statements_info', Base.metadata,
+    Column('dealloc', BigInteger),
+    Column('stats_reset', DateTime(True))
+)
 
 
 class Aircraft(Base):
@@ -140,6 +204,7 @@ class Uld(Base):
     last_scanned: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
 
     loadtype_loadtype: Mapped['Loadtype'] = relationship('Loadtype', back_populates='uld')
+    recovery_decision: Mapped[list['RecoveryDecision']] = relationship('RecoveryDecision', back_populates='uld')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='uld')
     offload: Mapped[list['Offload']] = relationship('Offload', back_populates='uld')
     uld_flight: Mapped[list['UldFlight']] = relationship('UldFlight', back_populates='uld')
@@ -169,6 +234,9 @@ class Flight(Base):
     planned_ldw: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
     planned_tow: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
     usable_capacity_kg: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
+    actual_baggage_weight: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
+    planned_baggage_weight: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(10, 2))
+    ata: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
 
     aircraft_aircraft: Mapped['Aircraft'] = relationship('Aircraft', back_populates='flight')
     awb_uld_flight: Mapped[list['AwbUldFlight']] = relationship('AwbUldFlight', back_populates='flight_flight')
@@ -176,6 +244,32 @@ class Flight(Base):
     uld_flight: Mapped[list['UldFlight']] = relationship('UldFlight', back_populates='flight_flight')
     recovery_plan_proposed_flight: Mapped[list['RecoveryPlan']] = relationship('RecoveryPlan', foreign_keys='[RecoveryPlan.proposed_flight_id]', back_populates='proposed_flight')
     recovery_plan_swap_original_flight: Mapped[list['RecoveryPlan']] = relationship('RecoveryPlan', foreign_keys='[RecoveryPlan.swap_original_flight_id]', back_populates='swap_original_flight')
+
+
+class RecoveryDecision(Base):
+    __tablename__ = 'recovery_decision'
+    __table_args__ = (
+        ForeignKeyConstraint(['awb_no'], ['awb.awb_no'], name='fk_decision_awb'),
+        ForeignKeyConstraint(['uld_id'], ['uld.uld_no'], name='fk_decision_uld'),
+        PrimaryKeyConstraint('decision_id', name='recovery_decision_pkey')
+    )
+
+    decision_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    work_item_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    uld_id: Mapped[str] = mapped_column(String(12), nullable=False)
+    awb_no: Mapped[str] = mapped_column(String(12), nullable=False)
+    document_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    decision: Mapped[str] = mapped_column(String(50), nullable=False)
+    reviewer_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    reviewed_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    option_id: Mapped[Optional[str]] = mapped_column(String(50))
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    target_work_item_id: Mapped[Optional[str]] = mapped_column(String(50))
+    confirmed_no_show_event_id: Mapped[Optional[str]] = mapped_column(String(50))
+
+    awb: Mapped['Awb'] = relationship('Awb', back_populates='recovery_decision')
+    uld: Mapped['Uld'] = relationship('Uld', back_populates='recovery_decision')
 
 
 class AwbUldFlight(Base):
@@ -211,10 +305,11 @@ class AwbUldFlight(Base):
 class Offload(Base):
     __tablename__ = 'offload'
     __table_args__ = (
-        CheckConstraint("source_type::text = ANY (ARRAY['Disrupted'::character varying, 'Predicted'::character varying, 'Displaced'::character varying]::text[])", name='chk_source_type'),
+        CheckConstraint("source_type::text = ANY (ARRAY['Disrupted'::character varying::text, 'Predicted'::character varying::text, 'Displaced'::character varying::text])", name='chk_source_type'),
         ForeignKeyConstraint(['flight_id'], ['flight.flight_id'], name='fk_offload_flight'),
         ForeignKeyConstraint(['uld_no'], ['uld.uld_no'], name='fk_offload_uld'),
-        PrimaryKeyConstraint('offload_id', name='offload_pkey')
+        PrimaryKeyConstraint('offload_id', name='offload_pkey'),
+        UniqueConstraint('uld_no', 'flight_id', name='unique_uld_flight_offload')
     )
 
     offload_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -222,6 +317,8 @@ class Offload(Base):
     flight_id: Mapped[str] = mapped_column(String(50), nullable=False)
     source_type: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('CURRENT_TIMESTAMP'))
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[Optional[str]] = mapped_column(String(20), server_default=text("'Pending'::character varying"))
 
     flight: Mapped['Flight'] = relationship('Flight', back_populates='offload')
     uld: Mapped['Uld'] = relationship('Uld', back_populates='offload')
@@ -249,8 +346,8 @@ class UldFlight(Base):
 class RecoveryPlan(Base):
     __tablename__ = 'recovery_plan'
     __table_args__ = (
-        CheckConstraint("plan_type::text = ANY (ARRAY['Replacement_From_Pool'::character varying, 'Swap_Same_Dest'::character varying, 'Rebook'::character varying]::text[])", name='chk_plan_type'),
-        CheckConstraint("status::text = ANY (ARRAY['Pending'::character varying, 'Approved'::character varying, 'Denied'::character varying]::text[])", name='chk_plan_status'),
+        CheckConstraint("plan_type::text = ANY (ARRAY['Replacement_From_Pool'::character varying::text, 'Swap_Same_Dest'::character varying::text, 'Rebook'::character varying::text])", name='chk_plan_type'),
+        CheckConstraint("status::text = ANY (ARRAY['Pending'::character varying::text, 'Approved'::character varying::text, 'Denied'::character varying::text])", name='chk_plan_status'),
         ForeignKeyConstraint(['offload_id'], ['offload.offload_id'], name='fk_plan_offload'),
         ForeignKeyConstraint(['proposed_flight_id'], ['flight.flight_id'], name='fk_plan_proposed_flight'),
         ForeignKeyConstraint(['swap_original_flight_id'], ['flight.flight_id'], name='fk_plan_swap_flight'),
