@@ -9,21 +9,34 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from src.nbnl_backend.db import get_db
 from src.nbnl_backend import models, schemas
 from src.nbnl_backend.bg_tasks_pri_risk import run_batch_update_job
+from src.nbnl_backend.bg_tasks_scanner import run_disruption_scanner
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Initialize and start the scheduler
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_batch_update_job, 'interval', minutes=15, next_run_time=datetime.now())
+    
+    # 1. Priority & Risk ML Calculator (Runs every 60 minutes)
+    scheduler.add_job(
+        run_batch_update_job, 
+        'interval', 
+        minutes=60, 
+        next_run_time=datetime.now() # Run immediately on startup
+    )
+    
+    # 2. Disruption Scanner (Runs every 5 minutes)
+    scheduler.add_job(
+        run_disruption_scanner, 
+        'interval', 
+        minutes=5, 
+        next_run_time=datetime.now() # Run immediately on startup
+    )
+    
     scheduler.start()
-    print("Background job scheduler started.")
-    
-    yield  # The application runs here
-    
-    # 2. Shutdown: Gracefully stop the scheduler
+    print("✅ Background job schedulers started (ML & Scanner).")
+    yield
     scheduler.shutdown()
-    print("Background job scheduler stopped.")
+    print("❌ Background job schedulers stopped.")
 
 app = FastAPI(title="Cathay Cargo API", lifespan=lifespan)
 router = APIRouter()

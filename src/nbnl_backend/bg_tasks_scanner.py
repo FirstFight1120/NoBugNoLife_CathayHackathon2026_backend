@@ -126,25 +126,9 @@ def run_disruption_scanner():
         for du in damaged_ulds:
             _flag_specific_uld(db, du.uld_uld_no, du.flight_flight_id, f"ULD {du.uld_uld_no} is damaged")
 
-        # =====================================================================
-        # CASE 10: Mislabelled ULD (Wrong Destination)
-        # =====================================================================
-        wrong_dest_cargo = db.query(models.AwbUldFlight).join(models.Flight, models.AwbUldFlight.flight_flight_id == models.Flight.flight_id)\
-            .join(models.Awb, models.AwbUldFlight.awb_awb_no == models.Awb.awb_no)\
-            .filter(
-                models.Flight.std > now, 
-                models.Flight.std < time_horizon,
-                models.Flight.dest != models.Awb.dest
-            ).all()
-        
-        for wdc in wrong_dest_cargo:
-            _flag_specific_uld(
-                db, wdc.uld_uld_no, wdc.flight_flight_id, 
-                f"Mislabelled ULD: Flight going to {wdc.flight_flight.dest}, but AWB is for {wdc.awb.dest}"
-            )
 
         # =====================================================================
-        # CASE 11: Predictive Offload (ML Model Output)
+        # CASE 10: Predictive Offload (ML Model Output)
         # =====================================================================
         # Threshold defined as 0.80 (80%)
         PREDICTION_THRESHOLD = 0.80
