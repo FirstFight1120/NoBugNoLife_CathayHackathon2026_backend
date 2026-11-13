@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 from datetime import datetime
 
@@ -62,17 +62,30 @@ class ForecastInfo(CamelModel):
     value_at_risk: float
     currency: str
 
+class ConfirmedOffload(CamelModel):
+    confirmed_at: str
+    source: str # OPERATIONAL_EVENT or AUTHORIZED_DECISION
+    source_event_id: str
+    reason: str
+
+class CaseSummary(CamelModel):
+    disruption: str
+    capacity_constraint: str
+    delivery_commitment: str
+    baseline_expected_loss: float
+    currency: str
+
 class PoolInfo(CamelModel):
-    source: str
+    source: str # DOMINO_OFFLOAD
     source_flight_id: str
     eligible_for_no_show_replacement: bool
     priority_hold: bool
-    disposition: str
+    disposition: str # AVAILABLE, PRIORITY_HOLD, NO_SHOW_REVIEW
 
 # --- Main Work Item Response ---
 class WorkItem(CamelModel):
     work_item_id: str
-    type: str # DISRUPTION, PREDICTED_OFFLOAD, PENDING_POOL
+    type: str
     status: str
     prediction_unit: str = "ULD"
     uld: ULDInfo
@@ -81,6 +94,10 @@ class WorkItem(CamelModel):
     cargo: CargoInfo
     document: DocumentInfo
     updated_at: str
+    
+    # Type-specific fields
+    confirmed_offload: Optional[ConfirmedOffload] = None
+    case_summary: Optional[CaseSummary] = None
     forecast: Optional[ForecastInfo] = None
     pool: Optional[PoolInfo] = None
 
@@ -115,16 +132,152 @@ class RecoverySolutionListResponse(CamelModel):
     workflow_control: WorkflowControl
     flight_summaries: Optional[List[FlightSummary]] = []
 
-# --- Action / Decisions ---
+
+class ReviewHistoryEntry(CamelModel):
+    decision_id: int
+    type: str
+    uld_id: str
+    master_airway_bill_number: str
+    document_version: int
+    option_id: Optional[str] = None
+    target_work_item_id: Optional[str] = None
+    confirmed_no_show_event_id: Optional[str] = None
+    decision: str
+    reason: str
+    reviewer_id: str
+    reviewed_at: str
+
+class RecoverySolutionDetailResponse(CamelModel):
+    # Common WorkItem fields flattened into the response
+    work_item_id: str
+    type: str
+    status: str
+    prediction_unit: str = "ULD"
+    uld: ULDInfo
+    master_airway_bill: MAWBInfo
+    flight: FlightInfo
+    cargo: CargoInfo
+    document: DocumentInfo
+    updated_at: str
+    
+    # Type specific fields
+    confirmed_offload: Optional[ConfirmedOffload] = None
+    case_summary: Optional[CaseSummary] = None
+    forecast: Optional[ForecastInfo] = None
+    pool: Optional[PoolInfo] = None
+    
+    # Detail specific fields
+    workflow_control: WorkflowControl
+    review_history: List[ReviewHistoryEntry]
+
+class RecoveryLegInfo(CamelModel):
+    # Using alias for "from" since it's a reserved keyword in Python
+    from_loc: str = Field(alias="from") 
+    to_loc: str = Field(alias="to")
+    operating_flight_id: str
+
+class CostBreakdown(CamelModel):
+    cargo_customer_impact: float
+    cathay_contribution_impact: float
+    recovery_and_handling_cost: float
+    delay_and_service_impact: float
+    downstream_network_impact: float
+    total_modeled_expected_loss: float
+    currency: str
+
+class RoutingOption(CamelModel):
+    option_id: str
+    option_type: str # rebook, reroute, wait_for_next_flight, split
+    recovery_legs: List[RecoveryLegInfo]
+    feasibility_status: str # Feasible, Infeasible, Feasibility Unknown
+    feasibility_percentage: int
+    usable_capacity_kg: float
+    capacity_status: str # Confirmed, Nominal / Weather Constrained, Capacity Confirmation Pending
+    fuel_constraint: str
+    weather_exposure: str
+    expected_arrival: str
+    expected_delay_minutes: int
+    recovery_handling_cost: float
+    total_modeled_expected_loss: float
+    cost_breakdown: CostBreakdown
+    missing_data: List[str]
+    network_impact: str
+
+class OptionsResponse(CamelModel):
+    work_item_id: str
+    type: str
+    best_options: List[str]
+    options: List[RoutingOption]
+    currency: str
+
+class NetworkDominoEffect(CamelModel):
+    affected_flights: List[str]
+    affected_uld_ids: List[str]
+    affected_shipment_ids: List[str]
+    additional_capacity_shortfall_kg: float
+    summary: str
+
+class ScenarioSensitivity(CamelModel):
+    input_change: str
+    feasibility_status: str
+    cost_breakdown: CostBreakdown
+
+class ExplanationInfo(CamelModel):
+    summary: str
+    reasons: List[str]
+    assumptions: List[str]
+    missing_data: List[str]
+
+class OptionDetailResponse(CamelModel):
+    work_item_id: str
+    option: RoutingOption
+    uld: ULDInfo
+    master_airway_bill: MAWBInfo
+    cost_breakdown: CostBreakdown
+    network_domino_effect: NetworkDominoEffect
+    scenario_sensitivity: List[ScenarioSensitivity]
+    explanation: ExplanationInfo
+
+class OffloadConfirmationRequest(CamelModel):
+    source: str # OPERATIONAL_EVENT or AUTHORIZED_DECISION
+    source_event_id: str
+    confirmed_at: str # ISO-8601
+    reason: str
+    reviewer_id: Optional[str] = None
+    document_version: int
+
+class ReplacementCandidateResponse(CamelModel):
+    candidate_work_item_id: str
+    target_work_item_id: str
+    eligibility: str # ELIGIBLE, INELIGIBLE, UNKNOWN
+    reasons: List[str]
+    missing_data: List[str]
+    route_compatible: bool
+    handling_compatible: bool
+    weight_capacity_available_kg: float
+    volume_capacity_available_m3: float
+    requires_confirmed_no_show: bool
+
 class DecisionRequest(CamelModel):
     type: str
     uld_id: str
     master_airway_bill_number: str
     document_version: int
     option_id: Optional[str] = None
-    decision: str # APPROVE_FOR_REVIEW, REJECT_OVERRIDE, etc.
+    target_work_item_id: Optional[str] = None
+    confirmed_no_show_event_id: Optional[str] = None
+    decision: str
     reason: str
     reviewer_id: str
     reviewed_at: str
-    target_work_item_id: Optional[str] = None
-    confirmed_no_show_event_id: Optional[str] = None
+
+class DecisionResponse(CamelModel):
+    decision_id: int
+    work_item_id: str
+    type: str
+    uld_id: str
+    master_airway_bill_number: str
+    document_version: int
+    decision: str
+    target_work_item_id: Optional[str]
+    reviewed_at: str

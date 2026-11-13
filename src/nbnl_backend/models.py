@@ -309,6 +309,7 @@ class Offload(Base):
         ForeignKeyConstraint(['flight_id'], ['flight.flight_id'], name='fk_offload_flight'),
         ForeignKeyConstraint(['uld_no'], ['uld.uld_no'], name='fk_offload_uld'),
         PrimaryKeyConstraint('offload_id', name='offload_pkey'),
+        UniqueConstraint('source_event_id', name='offload_source_event_id_key'),
         UniqueConstraint('uld_no', 'flight_id', name='unique_uld_flight_offload')
     )
 
@@ -319,6 +320,7 @@ class Offload(Base):
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('CURRENT_TIMESTAMP'))
     reason: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[Optional[str]] = mapped_column(String(20), server_default=text("'Pending'::character varying"))
+    source_event_id: Mapped[Optional[str]] = mapped_column(String(100), comment='Unique authoritative event identifier for idempotency')
 
     flight: Mapped['Flight'] = relationship('Flight', back_populates='offload')
     uld: Mapped['Uld'] = relationship('Uld', back_populates='offload')
