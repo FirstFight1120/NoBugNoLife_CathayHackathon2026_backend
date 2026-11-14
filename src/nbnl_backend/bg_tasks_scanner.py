@@ -4,11 +4,12 @@ from sqlalchemy.orm import Session, joinedload
 from src.nbnl_backend import models
 from src.nbnl_backend.db import SessionLocal
 
+
 def run_disruption_scanner():
     print("🚨 STARTING DISRUPTION SCANNER...")
     db: Session = SessionLocal()
     now = datetime.datetime.now()
-    time_horizon = now + datetime.timedelta(hours=24)
+    time_horizon = now + datetime.timedelta(days=7)  # Scan for disruptions in the next 7 days
 
     try:
         # =====================================================================
@@ -210,3 +211,4 @@ def _flag_specific_uld(db: Session, uld_no: str, flight_id: str, reason: str):
         status='Pending'
     )
     db.add(new_offload)
+    db.flush()

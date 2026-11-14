@@ -4,7 +4,9 @@ from sqlalchemy.orm import Session, joinedload
 from apscheduler.schedulers.background import BackgroundScheduler
 from typing import Optional
 from fastapi import FastAPI, APIRouter, Query, Depends, HTTPException, status, Response
+from fastapi.middleware.cors import CORSMiddleware
 import math
+
 
 
 from src.nbnl_backend.db import get_db
@@ -40,6 +42,15 @@ async def lifespan(app: FastAPI):
     print("Background job schedulers stopped.")
 
 app = FastAPI(title="Cathay Cargo API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (good for dev/hackathons)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allows all headers 
+)
+
 router = APIRouter()
 
 # Helper function to build the Workflow Control (Gating Logic)
