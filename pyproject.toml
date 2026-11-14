@@ -17,7 +17,10 @@ dependencies = [
 ]
 
 [project.scripts]
-nbnl-backend = "nbnl_backend:main"
+nbnl-backend = "src.nbnl_backend:main"
+
+[tool.fastapi]
+entrypoint = "src.nbnl_backend.main:app"
 
 [build-system]
 requires = ["uv_build>=0.12.24,<0.13.0"]

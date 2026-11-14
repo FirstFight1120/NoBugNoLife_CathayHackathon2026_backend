@@ -1,6 +1,10 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+import dotenv
+
+# Load environment variables from .env file
+dotenv.load_dotenv()
 
 # Docker will inject this directly. 
 # For local running, main.py will load the .env file.

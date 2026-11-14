@@ -54,22 +54,22 @@ app.add_middleware(
 )
 
 router = APIRouter()
-TERMINAL_STATUSES = ['RECOVERED', 'CLOSED', 'RETIRED', 'CLEARED']
+TERMINAL_STATUSES = ['RECOVERED', 'CLOSED', 'RETIRED', 'CLEARED', 'RECOVERY_IN_PROGRESS']
 
 def get_workflow_control(db: Session) -> dict:
     active_disruptions = db.query(models.Offload).filter(
         models.Offload.source_type == 'Disrupted', 
-        models.Offload.status.notin_(['RECOVERED', 'CLOSED'])
+        models.Offload.status.notin_(['RECOVERED', 'CLOSED', 'RECOVERY_IN_PROGRESS'])
     ).count()
     
     active_predictions = db.query(models.Offload).filter(
         models.Offload.source_type == 'Predicted',
-        models.Offload.status != 'CLEARED'
+        models.Offload.status.not_in(['CLEARED', 'RECOVERY_IN_PROGRESS'])
     ).count()
 
     active_pool = db.query(models.Offload).filter(
         models.Offload.source_type == 'Displaced',
-        models.Offload.status != 'RETIRED'
+        models.Offload.status.not_in(['RETIRED', 'RECOVERY_IN_PROGRESS'])
     ).count()
 
     active_priority = None
@@ -79,21 +79,21 @@ def get_workflow_control(db: Session) -> dict:
         active_priority = 1
         blocking = db.query(models.Offload).filter(
             models.Offload.source_type == 'Disrupted', 
-            models.Offload.status.notin_(['RECOVERED', 'CLOSED'])
+            models.Offload.status.notin_(['RECOVERED', 'CLOSED', 'RECOVERY_IN_PROGRESS'])
         ).all()
         blocking_ids = [str(b.offload_id) for b in blocking]
     elif active_predictions > 0:
         active_priority = 2
         blocking = db.query(models.Offload).filter(
             models.Offload.source_type == 'Predicted',
-            models.Offload.status != 'CLEARED'
+            models.Offload.status.not_in(['CLEARED', 'RECOVERY_IN_PROGRESS'])
         ).limit(3).all()
         blocking_ids = [str(b.offload_id) for b in blocking]
     elif active_pool > 0:
         active_priority = 3
         blocking = db.query(models.Offload).filter(
             models.Offload.source_type == 'Displaced',
-            models.Offload.status != 'RETIRED'
+            models.Offload.status.not_in(['RETIRED', 'RECOVERY_IN_PROGRESS'])
         ).limit(3).all()
         blocking_ids = [str(b.offload_id) for b in blocking]
 
