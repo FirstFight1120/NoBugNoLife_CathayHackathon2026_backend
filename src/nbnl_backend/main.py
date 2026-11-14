@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func, and_, or_
 from apscheduler.schedulers.background import BackgroundScheduler
 from typing import Optional
 from fastapi import FastAPI, APIRouter, Query, Depends, HTTPException, status, Response
@@ -20,12 +21,12 @@ async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler()
     
     # 1. Priority & Risk ML Calculator (Runs every 60 minutes)
-    scheduler.add_job(
-        run_batch_update_job, 
-        'interval', 
-        minutes=60, 
-        next_run_time=datetime.now(timezone.utc) # Run immediately on startup
-    )
+    #scheduler.add_job(
+    #    run_batch_update_job, 
+    #    'interval', 
+    #    minutes=60, 
+    #    next_run_time=datetime.now(timezone.utc) # Run immediately on startup
+    #)
     
     # 2. Disruption Scanner (Runs every 5 minutes)
     scheduler.add_job(
@@ -52,23 +53,19 @@ app.add_middleware(
 )
 
 router = APIRouter()
+TERMINAL_STATUSES = ['RECOVERED', 'CLOSED', 'RETIRED', 'CLEARED']
 
-# Helper function to build the Workflow Control (Gating Logic)
-# --- 1. WORKFLOW CONTROL (GATING LOGIC) ---
 def get_workflow_control(db: Session) -> dict:
-    # Terminal statuses for Disruptions: RECOVERED, CLOSED
     active_disruptions = db.query(models.Offload).filter(
         models.Offload.source_type == 'Disrupted', 
         models.Offload.status.notin_(['RECOVERED', 'CLOSED'])
     ).count()
     
-    # Terminal statuses for Predictions: CLEARED
-    active_predictions = db.query(models.AwbUldFlight).filter(
-        models.AwbUldFlight.offload_probability >= 0.80,
-        models.AwbUldFlight.status != 'CLEARED'
+    active_predictions = db.query(models.Offload).filter(
+        models.Offload.source_type == 'Predicted',
+        models.Offload.status != 'CLEARED'
     ).count()
 
-    # Terminal statuses for Pool: RETIRED
     active_pool = db.query(models.Offload).filter(
         models.Offload.source_type == 'Displaced',
         models.Offload.status != 'RETIRED'
@@ -82,17 +79,22 @@ def get_workflow_control(db: Session) -> dict:
         blocking = db.query(models.Offload).filter(
             models.Offload.source_type == 'Disrupted', 
             models.Offload.status.notin_(['RECOVERED', 'CLOSED'])
-        ).limit(3).all()
+        ).all()
         blocking_ids = [str(b.offload_id) for b in blocking]
     elif active_predictions > 0:
         active_priority = 2
-        blocking = db.query(models.AwbUldFlight).filter(
-            models.AwbUldFlight.offload_probability >= 0.80,
-            models.AwbUldFlight.status != 'CLEARED'
+        blocking = db.query(models.Offload).filter(
+            models.Offload.source_type == 'Predicted',
+            models.Offload.status != 'CLEARED'
         ).limit(3).all()
-        blocking_ids = [f"{b.awb_awb_no}-{b.uld_uld_no}" for b in blocking]
+        blocking_ids = [str(b.offload_id) for b in blocking]
     elif active_pool > 0:
         active_priority = 3
+        blocking = db.query(models.Offload).filter(
+            models.Offload.source_type == 'Displaced',
+            models.Offload.status != 'RETIRED'
+        ).limit(3).all()
+        blocking_ids = [str(b.offload_id) for b in blocking]
 
     return {
         "active_priority": active_priority,
@@ -114,82 +116,92 @@ def list_recovery_solutions(
     type: Optional[str] = Query(None, pattern="^(DISRUPTION|PREDICTED_OFFLOAD|PENDING_POOL)$"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
-    master_airway_bill_number: Optional[str] = None,
-    flight_id: Optional[str] = None,
+    master_airway_bill_number: Optional[str] = Query(None, alias="masterAirwayBillNumber"),
+    flight_id: Optional[str] = Query(None, alias="flightId"),
     status: Optional[str] = None,
-    include_closed: bool = False,
+    include_closed: bool = Query(False, alias="includeClosed"),
     db: Session = Depends(get_db)
 ):
-    workflow_control = get_workflow_control(db)
-    items = []
+    # 1. Get Gating Logic
+    workflow_control_data = get_workflow_control(db)
+    workflow_control = schemas.WorkflowControl(**workflow_control_data)
 
-    # --- BASE QUERIES & COUNTS (Independent of `type` filter) ---
-    q_disruptions = db.query(models.Offload).filter(models.Offload.source_type == 'Disrupted')
-    if not include_closed: q_disruptions = q_disruptions.filter(models.Offload.status.notin_(['RECOVERED', 'CLOSED', 'Resolved']))
-    if flight_id: q_disruptions = q_disruptions.filter(models.Offload.flight_id == flight_id)
-    if status: q_disruptions = q_disruptions.filter(models.Offload.status == status)
-    total_disruptions = q_disruptions.count()
+    # 2. Build the Base Query (applies to all filters EXCEPT `type`)
+    base_query = db.query(models.Offload)
+    
+    # Filter by AWB (Requires joining the ternary table)
+    if master_airway_bill_number:
+        base_query = base_query.join(
+            models.AwbUldFlight,
+            and_(
+                models.Offload.uld_no == models.AwbUldFlight.uld_uld_no,
+                models.Offload.flight_id == models.AwbUldFlight.flight_flight_id
+            )
+        ).filter(models.AwbUldFlight.awb_awb_no == master_airway_bill_number)
 
-    q_predictions = db.query(models.AwbUldFlight).filter(models.AwbUldFlight.offload_probability >= 0.80)
-    if not include_closed: q_predictions = q_predictions.filter(models.AwbUldFlight.status != 'CLEARED')
-    if flight_id: q_predictions = q_predictions.filter(models.AwbUldFlight.flight_flight_id == flight_id)
-    if master_airway_bill_number: q_predictions = q_predictions.filter(models.AwbUldFlight.awb_awb_no == master_airway_bill_number)
-    total_predictions = q_predictions.count()
+    if flight_id:
+        base_query = base_query.filter(models.Offload.flight_id == flight_id)
+        
+    if status:
+        base_query = base_query.filter(models.Offload.status == status)
+        
+    if not include_closed:
+        base_query = base_query.filter(models.Offload.status.notin_(TERMINAL_STATUSES))
 
-    q_pool = db.query(models.Offload).filter(models.Offload.source_type == 'Displaced')
-    if not include_closed: q_pool = q_pool.filter(models.Offload.status != 'RETIRED')
-    if flight_id: q_pool = q_pool.filter(models.Offload.flight_id == flight_id)
-    if status: q_pool = q_pool.filter(models.Offload.status == status)
-    total_pool = q_pool.count()
+    # 3. Calculate Counts for ALL types (independent of the `type` filter)
+    total_by_type = {
+        "DISRUPTION": base_query.filter(models.Offload.source_type == 'Disrupted').count(),
+        "PREDICTED_OFFLOAD": base_query.filter(models.Offload.source_type == 'Predicted').count(),
+        "PENDING_POOL": base_query.filter(models.Offload.source_type == 'Displaced').count()
+    }
 
-    # --- FETCH DATA BASED ON TYPE ---
-    if type in [None, "DISRUPTION"]:
-        disruptions = q_disruptions.options(
-            joinedload(models.Offload.uld).joinedload(models.Uld.loadtype_loadtype),
-            joinedload(models.Offload.flight).joinedload(models.Flight.aircraft_aircraft)
-        ).all()
-        for d in disruptions:
-            items.append(_map_offload_to_work_item(d, "DISRUPTION"))
+    # 4. Apply the specific `type` filter (if provided) for fetching items
+    query = base_query
+    if type == "DISRUPTION":
+        query = query.filter(models.Offload.source_type == 'Disrupted')
+    elif type == "PREDICTED_OFFLOAD":
+        query = query.filter(models.Offload.source_type == 'Predicted')
+    elif type == "PENDING_POOL":
+        query = query.filter(models.Offload.source_type == 'Displaced')
 
-    if type in [None, "PREDICTED_OFFLOAD"]:
-        predictions = q_predictions.options(
-            joinedload(models.AwbUldFlight.awb).joinedload(models.Awb.shipment),
-            joinedload(models.AwbUldFlight.uld).joinedload(models.Uld.loadtype_loadtype),
-            joinedload(models.AwbUldFlight.flight_flight).joinedload(models.Flight.aircraft_aircraft)
-        ).all()
-        for p in predictions:
-            items.append(_map_prediction_to_work_item(p))
-
-    if type in [None, "PENDING_POOL"]:
-        pool_items = q_pool.options(
-            joinedload(models.Offload.uld).joinedload(models.Uld.loadtype_loadtype),
-            joinedload(models.Offload.flight).joinedload(models.Flight.aircraft_aircraft)
-        ).all()
-        for p in pool_items:
-            items.append(_map_offload_to_work_item(p, "PENDING_POOL"))
-
-    # --- PAGINATION ---
-    total_items = len(items)
-    start_idx = (page - 1) * limit
-    paginated_items = items[start_idx:start_idx + limit]
+    # 5. Execute Query with Pagination
+    total_items = query.count()
     total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+    
+    offloads = query.options(
+        joinedload(models.Offload.uld).joinedload(models.Uld.loadtype_loadtype),
+        joinedload(models.Offload.flight).joinedload(models.Flight.aircraft_aircraft)
+    ).order_by(models.Offload.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
 
-    # --- FLIGHT SUMMARIES ---
+    # 6. Map to WorkItems
+    items = []
+    for o in offloads:
+        items.append(_map_offload_to_work_item(db, o))
+
+    # 7. Generate Flight Summaries (Only for PREDICTED_OFFLOAD)
     flight_summaries = []
     if type in [None, "PREDICTED_OFFLOAD"]:
-        # Aggregate ULDs by Flight
-        flight_map = {}
-        for p in predictions:
-            fid = p.flight_flight_id
-            if fid not in flight_map:
-                flight_map[fid] = {
+        # We query all predictions (ignoring pagination) for this specific view
+        pred_query = base_query.filter(models.Offload.source_type == 'Predicted')
+        
+        # Group by flight_id
+        flight_groups = pred_query.options(
+            joinedload(models.Offload.flight).joinedload(models.Flight.aircraft_aircraft),
+            joinedload(models.Offload.uld)
+        ).all()
+        
+        grouped_data = {}
+        for p in flight_groups:
+            fid = p.flight_id
+            if fid not in grouped_data:
+                grouped_data[fid] = {
                     "flightId": fid,
-                    "origin": p.flight_flight.origin or "UNK",
-                    "destination": p.flight_flight.dest or "UNK",
-                    "scheduledDeparture": p.flight_flight.std.isoformat() + "Z" if p.flight_flight.std else "",
-                    "aircraftType": p.flight_flight.aircraft_aircraft.aircraft_type if p.flight_flight.aircraft_aircraft else None,
+                    "origin": p.flight.origin or "UNK",
+                    "destination": p.flight.dest or "UNK",
+                    "scheduledDeparture": p.flight.std.isoformat() + "Z" if p.flight.std else "",
+                    "aircraftType": p.flight.aircraft_aircraft.aircraft_type if p.flight.aircraft_aircraft else None,
                     "offloadProbability": 0.0,
-                    "capacityShortfallKg": 600.0, # Mocked, should come from Flight model
+                    "capacityShortfallKg": 600.0, # Mocked for now
                     "forecastCargoCapacityKg": 12000.0, # Mocked
                     "bookedWeightKg": 12600.0, # Mocked
                     "affectedUldCount": 0,
@@ -197,59 +209,85 @@ def list_recovery_solutions(
                     "valueAtRisk": 0.0,
                     "currency": "HKD",
                     "confidence": 0,
-                    "forecastedAt": p.forecast_timestamp.isoformat() + "Z" if p.forecast_timestamp else "",
-                    "reasons": []
+                    "forecastedAt": "",
+                    "reasons": set()
                 }
             
-            f_sum = flight_map[fid]
-            f_sum["affectedUldCount"] += 1
-            f_sum["offloadProbability"] = max(f_sum["offloadProbability"], float(p.offload_probability or 0))
-            f_sum["confidence"] = max(f_sum["confidence"], int(float(p.forecast_confidence or 0) * 100))
-            f_sum["valueAtRisk"] += float(p.awb.declared_value or 0) if p.awb else 0
+            # Find the specific manifest record to get ML data
+            manifest = db.query(models.AwbUldFlight).filter(
+                models.AwbUldFlight.uld_uld_no == p.uld_no,
+                models.AwbUldFlight.flight_flight_id == fid
+            ).first()
             
-            if p.awb and p.awb.shipment:
-                for s in p.awb.shipment:
-                    f_sum["shipmentIds"].add(s.s_no)
-            if p.risk_reasons and isinstance(p.risk_reasons, list):
-                f_sum["reasons"].extend(p.risk_reasons)
-        
-        for fid, summary in flight_map.items():
+            f_sum = grouped_data[fid]
+            f_sum["affectedUldCount"] += 1
+            
+            if manifest:
+                # Aggregate ML data
+                prob = float(manifest.offload_probability or 0)
+                f_sum["offloadProbability"] = max(f_sum["offloadProbability"], prob)
+                f_sum["confidence"] = max(f_sum["confidence"], int(float(manifest.forecast_confidence or 0) * 100))
+                
+                ts = manifest.forecast_timestamp.isoformat() + "Z" if manifest.forecast_timestamp else ""
+                if ts > f_sum["forecastedAt"]:
+                    f_sum["forecastedAt"] = ts
+                    
+                if manifest.risk_reasons and isinstance(manifest.risk_reasons, list):
+                    for r in manifest.risk_reasons:
+                        f_sum["reasons"].add(str(r))
+                
+                # Aggregate AWB data
+                if manifest.awb:
+                    f_sum["valueAtRisk"] += float(manifest.awb.declared_value or 0)
+                    for s in manifest.awb.shipment:
+                        f_sum["shipmentIds"].add(s.s_no)
+
+        # Clean up sets for JSON serialization
+        for fid, summary in grouped_data.items():
             summary["shipmentIds"] = list(summary["shipmentIds"])
-            summary["reasons"] = list(set(summary["reasons"]))
+            summary["reasons"] = list(summary["reasons"])
             flight_summaries.append(summary)
 
-    return {
-        "items": paginated_items,
-        "total_items": total_items,
-        "total_by_type": {
-            "DISRUPTION": total_disruptions,
-            "PREDICTED_OFFLOAD": total_predictions,
-            "PENDING_POOL": total_pool
-        },
-        "pagination": {
-            "page": page,
-            "total_pages": total_pages,
-            "has_next_page": page < total_pages
-        },
-        "workflow_control": workflow_control,
-        "flight_summaries": flight_summaries
-    }
-
+    # 8. Return the Final Envelope
+    return schemas.RecoverySolutionListResponse(
+        items=items,
+        total_items=total_items,
+        total_by_type=total_by_type,
+        pagination=schemas.Pagination(
+            page=page,
+            total_pages=total_pages,
+            has_next_page=page < total_pages
+        ),
+        workflow_control=workflow_control,
+        flight_summaries=flight_summaries
+    )
 
 # --- 3. MAPPERS ---
 
-def _map_offload_to_work_item(offload: models.Offload, item_type: str):
-    manifest = offload.uld.awb_uld_flight[0] if offload.uld and offload.uld.awb_uld_flight else None
-    awb = manifest.awb if manifest else None
+def _map_offload_to_work_item(db: Session, offload: models.Offload) -> schemas.WorkItem:
+    # 1. Determine Type
+    if offload.source_type == 'Disrupted':
+        item_type = "DISRUPTION"
+    elif offload.source_type == 'Predicted':
+        item_type = "PREDICTED_OFFLOAD"
+    else:
+        item_type = "PENDING_POOL"
+
+    # 2. Fetch Base Data
+    manifest = db.query(models.AwbUldFlight).filter(
+        models.AwbUldFlight.uld_uld_no == offload.uld_no,
+        models.AwbUldFlight.flight_flight_id == offload.flight_id
+    ).first()
     
-    # Base fields
+    awb = manifest.awb if manifest else None
+
     result = schemas.WorkItem(
-        work_item_id=str(offload.offload_id),
+        work_item_id=str(offload.offload_id), # Always the numeric ID
         type=item_type,
         status=offload.status or "PENDING",
         uld=schemas.ULDInfo(
             uld_id=offload.uld.uld_no,
-            uld_type=offload.uld.loadtype_loadtype.l_type or "UNK" if offload.uld and offload.uld.loadtype_loadtype else "UNK",
+            uld_type=(offload.uld.loadtype_loadtype.l_type or "UNK") if offload.uld and offload.uld.loadtype_loadtype else "UNK",
             weight_kg=float(manifest.weight or 0) if manifest else 0.0,
             volume_m3=float(manifest.volume or 0) if manifest else 0.0,
             origin=offload.flight.origin or "UNK",
@@ -279,12 +317,12 @@ def _map_offload_to_work_item(offload: models.Offload, item_type: str):
         document=schemas.DocumentInfo(
             document_id=f"MAWB-DOC-{awb.awb_no}" if awb else "UNKNOWN",
             version=awb.document_version or 1 if awb else 1,
-            updated_at=datetime.now(timezone.utc).isoformat() + "Z"
+            updated_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         ),
-        updated_at=datetime.now(timezone.utc).isoformat() + "Z"
+        updated_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
 
-    # Type-specific data
+    # 3. Type-Specific Mapping
     if item_type == "DISRUPTION":
         result.confirmed_offload = schemas.ConfirmedOffload(
             confirmed_at=offload.created_at.isoformat() + "Z" if offload.created_at else "",
@@ -299,124 +337,55 @@ def _map_offload_to_work_item(offload: models.Offload, item_type: str):
             baseline_expected_loss=float(awb.declared_value or 0) * 1.25 if awb else 0.0,
             currency="HKD"
         )
+        
+    elif item_type == "PREDICTED_OFFLOAD":
+        safe_reasons = manifest.risk_reasons if manifest and isinstance(manifest.risk_reasons, list) else ["Operational constraints"]
+        
+        # Fallback confidence to 85% if null
+        confidence_val = int(float(manifest.forecast_confidence or 0.85) * 100) if manifest else 85
+        
+        result.forecast = schemas.ForecastInfo(
+            offload_probability=float(manifest.offload_probability or 0) if manifest else 0.0,
+            capacity_shortfall_kg=600.0, 
+            confidence=confidence_val, # Used fallback here
+            forecasted_at=manifest.forecast_timestamp.isoformat() + "Z" if manifest and manifest.forecast_timestamp else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            reasons=safe_reasons, # Used fallback here
+            forecast_cargo_capacity_kg=12000.0, 
+            booked_weight_kg=12600.0, 
+            value_at_risk=float(awb.declared_value or 0) if awb else 0.0,
+            currency="HKD"
+        )
+
     elif item_type == "PENDING_POOL":
         result.pool = schemas.PoolInfo(
             source="DOMINO_OFFLOAD",
             source_flight_id=offload.flight_id,
             eligible_for_no_show_replacement=True,
-            priority_hold=(offload.status == "PRIORITY_HOLD"), # True if held
-            disposition=offload.status or "AVAILABLE" # Will output PRIORITY_HOLD or NO_SHOW_REVIEW
+            priority_hold=(offload.status == "PRIORITY_HOLD"),
+            disposition=offload.status or "AVAILABLE"
         )
 
     return result
 
-def _map_prediction_to_work_item(pred: models.AwbUldFlight):
-    safe_reasons = pred.risk_reasons if isinstance(pred.risk_reasons, list) else []
-    
-    result = schemas.WorkItem(
-        work_item_id=f"{pred.awb_awb_no}-{pred.uld_uld_no}",
-        type="PREDICTED_OFFLOAD",
-        status="PREVENTIVE_ACTION_REQUIRED" if float(pred.offload_probability or 0) >= 0.90 else "AT_RISK",
-        uld=schemas.ULDInfo(
-            uld_id=pred.uld_uld_no,
-            uld_type=pred.uld.loadtype_loadtype.l_type or "UNK" if pred.uld and pred.uld.loadtype_loadtype else "UNK",
-            weight_kg=float(pred.weight or 0),
-            volume_m3=float(pred.volume or 0),
-            origin=pred.awb.origin or "UNK",
-            destination=pred.awb.dest or "UNK"
-        ),
-        master_airway_bill=schemas.MAWBInfo(
-            number=pred.awb_awb_no,
-            document_id=f"MAWB-DOC-{pred.awb_awb_no}",
-            display_label=f"MAWB {pred.awb_awb_no}"
-        ),
-        flight=schemas.FlightInfo(
-            flight_id=pred.flight_flight.flight_id,
-            origin=pred.flight_flight.origin or "UNK",
-            destination=pred.flight_flight.dest or "UNK",
-            scheduled_departure=pred.flight_flight.std.isoformat() + "Z" if pred.flight_flight.std else "",
-            aircraft_type=pred.flight_flight.aircraft_aircraft.aircraft_type if pred.flight_flight.aircraft_aircraft else None
-        ),
-        cargo=schemas.CargoInfo(
-            shipment_ids=[s.s_no for s in pred.awb.shipment],
-            weight_kg=float(pred.weight or 0),
-            volume_m3=float(pred.volume or 0),
-            handling_requirements=["GENERAL_CARGO"],
-            commodity=None,
-            value_at_risk=float(pred.awb.declared_value or 0),
-            currency="HKD"
-        ),
-        document=schemas.DocumentInfo(
-            document_id=f"MAWB-DOC-{pred.awb_awb_no}",
-            version=pred.awb.document_version or 1 if pred.awb else 1,
-            updated_at=datetime.now(timezone.utc).isoformat() + "Z"
-        ),
-        updated_at=datetime.now(timezone.utc).isoformat() + "Z"
-    )
-
-    result.forecast = schemas.ForecastInfo(
-        offload_probability=float(pred.offload_probability or 0),
-        capacity_shortfall_kg=600.0, 
-        confidence=int(float(pred.forecast_confidence or 0) * 100),
-        forecasted_at=pred.forecast_timestamp.isoformat() + "Z" if pred.forecast_timestamp else datetime.now(timezone.utc).isoformat() + "Z",
-        reasons=safe_reasons,
-        forecast_cargo_capacity_kg=12000.0, 
-        booked_weight_kg=12600.0, 
-        value_at_risk=float(pred.awb.declared_value or 0),
-        currency="HKD"
-    )
-
-    result.case_summary = schemas.CaseSummary(
-        disruption="Ramp weather and updated fuel requirement", # Mocked or parse from safe_reasons
-        capacity_constraint="Forecast cargo capacity is 600 kg below booked weight",
-        delivery_commitment=f"Customer delivery commitment: {pred.awb.contract_ddl.strftime('%Y-%m-%d')}" if pred.awb.contract_ddl else "Unknown",
-        baseline_expected_loss=float(pred.awb.declared_value or 0) * 1.25,
-        currency="HKD"
-    )
-
-    return result
 
 # --- ENDPOINT 2: GET SINGLE WORK ITEM ---
 @router.get("/api/v1/recovery-solutions/{work_item_id}", response_model=schemas.RecoverySolutionDetailResponse)
 def get_recovery_solution_detail(work_item_id: str, db: Session = Depends(get_db)):
     workflow_control = get_workflow_control(db)
-    work_item = None
     
-    # 1. Identify and fetch the Work Item
-    # If the ID is purely digits, it's an Offload (Disruption or Pool)
-    if work_item_id.isdigit():
-        offload = db.query(models.Offload).options(
-            joinedload(models.Offload.uld).joinedload(models.Uld.loadtype_loadtype),
-            joinedload(models.Offload.flight).joinedload(models.Flight.aircraft_aircraft)
-        ).filter(models.Offload.offload_id == int(work_item_id)).first()
-        
-        if offload:
-            if offload.source_type == 'Disrupted':
-                work_item = _map_offload_to_work_item(offload, "DISRUPTION")
-            elif offload.source_type == 'Displaced':
-                work_item = _map_offload_to_work_item(offload, "PENDING_POOL")
+    # 1. Fetch the Offload Record (raise 404 if not found)
+    offload = db.query(models.Offload).options(
+        joinedload(models.Offload.uld).joinedload(models.Uld.loadtype_loadtype),
+        joinedload(models.Offload.flight).joinedload(models.Flight.aircraft_aircraft)
+    ).filter(models.Offload.offload_id == int(work_item_id)).first()
     
-    # If it's not an Offload, assume it's a Prediction (AwbUldFlight) formatted as "AWB-ULD"
-    else:
-        if '-' in work_item_id:
-            awb_no, uld_no = work_item_id.rsplit('-', 1)
-            
-            pred = db.query(models.AwbUldFlight).options(
-                joinedload(models.AwbUldFlight.awb).joinedload(models.Awb.shipment),
-                joinedload(models.AwbUldFlight.uld).joinedload(models.Uld.loadtype_loadtype),
-                joinedload(models.AwbUldFlight.flight_flight).joinedload(models.Flight.aircraft_aircraft)
-            ).filter(
-                models.AwbUldFlight.awb_awb_no == awb_no,
-                models.AwbUldFlight.uld_uld_no == uld_no
-            ).first()
-            
-            if pred and pred.offload_probability and float(pred.offload_probability) >= 0.80:
-                work_item = _map_prediction_to_work_item(pred)
-    
-    if not work_item:
+    if not offload:
         raise HTTPException(status_code=404, detail="Work item not found")
 
-    # 2. Fetch Review History
+    # 2. Map to WorkItem (Pylance will now know this is a valid schemas.WorkItem)
+    work_item: schemas.WorkItem = _map_offload_to_work_item(db, offload)
+
+    # 3. Fetch Review History
     decisions = db.query(models.RecoveryDecision).filter(
         models.RecoveryDecision.work_item_id == work_item_id
     ).order_by(models.RecoveryDecision.reviewed_at.desc()).all()
@@ -430,273 +399,270 @@ def get_recovery_solution_detail(work_item_id: str, db: Session = Depends(get_db
             master_airway_bill_number=d.awb_no,
             document_version=d.document_version,
             option_id=d.option_id,
-            # NEW FIELDS ADDED:
             target_work_item_id=d.target_work_item_id,
             confirmed_no_show_event_id=d.confirmed_no_show_event_id,
-            # ------------------
             decision=d.decision,
-            reason=d.reason or "No reason provided", 
+            reason=d.reason or "No reason provided",
             reviewer_id=d.reviewer_id,
             reviewed_at=d.reviewed_at.strftime("%Y-%m-%dT%H:%M:%SZ") if d.reviewed_at else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         ))
 
-
-    # 3. Construct the detailed response
+    # 4. Construct Response
     response_dict = work_item.model_dump()
-    response_dict["workflow_control"] = workflow_control
+    response_dict["workflow_control"] = get_workflow_control(db)
     response_dict["review_history"] = history
     
     return response_dict
 
-# --- HELPER: Generate Mock Options (Used by Endpoint 3 & 4) ---
-def _generate_mock_options(uld_no: str):
-    now_utc = datetime.now(timezone.utc)
-    eta1 = (now_utc + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    eta2 = (now_utc + timedelta(hours=18)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    eta3 = (now_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _generate_real_plans(db: Session, offload: models.Offload) -> list[models.RecoveryPlan]:
+    print(f"\n🔍 DEBUG: Generating options for Offload ID {offload.offload_id}")
+    
+    offloaded_uld = db.query(models.Uld).filter(models.Uld.uld_no == offload.uld_no).first()
+    manifest = db.query(models.AwbUldFlight).filter(
+        models.AwbUldFlight.uld_uld_no == offload.uld_no,
+        models.AwbUldFlight.flight_flight_id == offload.flight_id
+    ).first()
+    
+    if not manifest or not offloaded_uld:
+        print("❌ DEBUG: Manifest or ULD not found.")
+        return []
+        
+    awb = manifest.awb
+    original_flight = db.query(models.Flight).filter(models.Flight.flight_id == offload.flight_id).first()
+    
+    if not original_flight or not original_flight.std or not original_flight.origin or not original_flight.dest or not awb.contract_ddl:
+        print("❌ DEBUG: Missing core flight data or AWB deadline.")
+        return []
+        
+    buffer_time = awb.contract_ddl - timedelta(hours=3)
+    print(f"🕒 Original Flight: {original_flight.flight_id} | STD: {original_flight.std}")
+    print(f"🕒 AWB Deadline: {awb.contract_ddl} | Buffer Time: {buffer_time}")
+    
+    candidate_flights = db.query(models.Flight).filter(
+        models.Flight.origin == original_flight.origin,
+        models.Flight.dest == original_flight.dest,
+        models.Flight.std > original_flight.std,
+        models.Flight.std < buffer_time,
+        models.Flight.status.notin_(['CANCELLED'])
+    ).order_by(models.Flight.std.asc()).all()
 
-    option_1 = schemas.RoutingOption(
-        option_id=f"OPT-{uld_no}-01",
-        option_type="reroute",
-        recovery_legs=[
-            schemas.RecoveryLegInfo(**{"from": "HKG", "to": "DOH", "operating_flight_id": "CX660"}),
-            schemas.RecoveryLegInfo(**{"from": "DOH", "to": "FRA", "operating_flight_id": "QR001"})
-        ],
-        feasibility_status="Feasible",
-        feasibility_percentage=97,
-        usable_capacity_kg=1200.0,
-        capacity_status="Confirmed",
-        fuel_constraint="None",
-        weather_exposure="Low",
-        expected_arrival=eta1,
-        expected_delay_minutes=180,
-        recovery_handling_cost=4760.0,
-        total_modeled_expected_loss=50780.0,
-        cost_breakdown=schemas.CostBreakdown(
-            cargo_customer_impact=40000.0,
-            cathay_contribution_impact=6020.0,
-            recovery_and_handling_cost=4760.0,
-            delay_and_service_impact=0.0,
-            downstream_network_impact=0.0,
-            total_modeled_expected_loss=50780.0,
-            currency="HKD"
-        ),
-        missing_data=[],
-        network_impact="Confirmed capacity; no displaced cargo identified."
-    )
+    print(f"✈️ Found {len(candidate_flights)} candidate flights before deadline.")
+    for f in candidate_flights:
+        print(f"   -> Candidate: {f.flight_id} | STD: {f.std}")
 
-    option_2 = schemas.RoutingOption(
-        option_id=f"OPT-{uld_no}-02",
-        option_type="wait_for_next_flight",
-        recovery_legs=[
-            schemas.RecoveryLegInfo(**{"from": "HKG", "to": "FRA", "operating_flight_id": "CX291"})
-        ],
-        feasibility_status="Feasible",
-        feasibility_percentage=100,
-        usable_capacity_kg=1400.0,
-        capacity_status="Confirmed",
-        fuel_constraint="None",
-        weather_exposure="Clear",
-        expected_arrival=eta2,
-        expected_delay_minutes=600,
-        recovery_handling_cost=1720.0,
-        total_modeled_expected_loss=53980.0,
-        cost_breakdown=schemas.CostBreakdown(
-            cargo_customer_impact=52260.0,
-            cathay_contribution_impact=0.0,
-            recovery_and_handling_cost=1720.0,
-            delay_and_service_impact=0.0,
-            downstream_network_impact=0.0,
-            total_modeled_expected_loss=53980.0,
-            currency="HKD"
-        ),
-        missing_data=[],
-        network_impact="No downstream displacement identified."
-    )
+    plans = []
+    offload_weight = float(manifest.weight or 0)
+    if offloaded_uld.loadtype_loadtype:
+        offload_weight += float(offloaded_uld.loadtype_loadtype.tare_weight_kg or 0)
+    print(f"⚖️ Offload Weight (with tare): {offload_weight} kg")
 
-    option_3 = schemas.RoutingOption(
-        option_id=f"OPT-{uld_no}-03",
-        option_type="rebook",
-        recovery_legs=[
-            schemas.RecoveryLegInfo(**{"from": "HKG", "to": "FRA", "operating_flight_id": "CX289"})
-        ],
-        feasibility_status="Infeasible",
-        feasibility_percentage=10,
-        usable_capacity_kg=0.0,
-        capacity_status="Capacity Confirmation Pending",
-        fuel_constraint="Weather penalty expected",
-        weather_exposure="High",
-        expected_arrival=eta3,
-        expected_delay_minutes=1440,
-        recovery_handling_cost=5000.0,
-        total_modeled_expected_loss=85000.0,
-        cost_breakdown=schemas.CostBreakdown(
-            cargo_customer_impact=80000.0,
-            cathay_contribution_impact=0.0,
-            recovery_and_handling_cost=5000.0,
-            delay_and_service_impact=0.0,
-            downstream_network_impact=0.0,
-            total_modeled_expected_loss=85000.0,
-            currency="HKD"
-        ),
-        missing_data=["Station acceptance unconfirmed", "Payload limit exceeded"],
-        network_impact="None"
-    )
+    for flight in candidate_flights:
+        if not flight.std: continue
+            
+        delay = int((flight.std - original_flight.std).total_seconds() / 60)
+        
+        booked_weight = sum(float(a.weight or 0) for a in flight.awb_uld_flight if a.weight)
+        usable_capacity = float(flight.usable_capacity_kg or 0) if flight.usable_capacity_kg else 0.0
+        if usable_capacity == 0.0 and flight.aircraft_aircraft:
+            usable_capacity = float(flight.aircraft_aircraft.max_payload_weight or 0)
+            
+        remaining_capacity = usable_capacity - booked_weight
+        print(f"   -> Flight {flight.flight_id}: Capacity {usable_capacity}, Booked {booked_weight}, Remaining {remaining_capacity}")
+        
+        if remaining_capacity >= offload_weight:
+            print(f"      ✅ IDLE SPACE found on {flight.flight_id}")
+            plan = models.RecoveryPlan(
+                offload_id=offload.offload_id, plan_type='IDLE_SPACE',
+                proposed_flight_id=flight.flight_id, status='Pending',
+                feasibility_score=100.0, expected_delay_minutes=delay,
+                total_modeled_expected_loss=float(awb.declared_value or 0) * (delay / 1440.0),
+                notes=f"Direct rebook. Remaining capacity: {remaining_capacity:.0f} kg."
+            )
+            plans.append(plan)
+        else:
+            eligible_swap = [
+                a for a in flight.awb_uld_flight 
+                if a.awb and a.awb.priority_score is not None 
+                and float(a.awb.priority_score) > float(awb.priority_score or 0)
+                and float(a.weight or 0) >= (offload_weight - remaining_capacity)
+            ]
+            
+            if eligible_swap:
+                print(f"      🔄 SWAP possible on {flight.flight_id}")
+                swap_target = sorted(eligible_swap, key=lambda x: float(x.awb.priority_score or 0), reverse=True)[0]
+                plan = models.RecoveryPlan(
+                    offload_id=offload.offload_id, plan_type='SWAP_DISPLACED',
+                    proposed_flight_id=flight.flight_id, status='Pending',
+                    feasibility_score=75.0, expected_delay_minutes=delay,
+                    total_modeled_expected_loss=float(awb.declared_value or 0) * (delay / 1440.0) * 1.5,
+                    swap_uld_no=swap_target.uld_uld_no,
+                    notes=f"Requires swapping {swap_target.uld_uld_no} (Priority {swap_target.awb.priority_score})."
+                )
+                plans.append(plan)
 
-    return [option_1, option_2, option_3]
+    for p in plans:
+        db.add(p)
+    db.commit()
+    return plans
 
 # --- ENDPOINT 3: GET CANDIDATE ROUTING OPTIONS ---
 @router.get("/api/v1/recovery-solutions/{work_item_id}/options", response_model=schemas.OptionsResponse)
 def get_recovery_options(work_item_id: str, db: Session = Depends(get_db)):
-    
-    item_type = None
-    uld_no = None
-    awb_no = None
-    
-    # 1. Validate Work Item & Determine Type
-    if work_item_id.isdigit():
-        offload = db.query(models.Offload).filter(models.Offload.offload_id == int(work_item_id)).first()
-        if not offload:
-            raise HTTPException(status_code=404, detail="Work item not found")
-            
-        if offload.source_type == 'Displaced':
-            raise HTTPException(status_code=400, detail="Pool ULDs are evaluated against a target using the replacement-candidates endpoint. They do not get routing options.")
-        elif offload.source_type == 'Disrupted':
-            item_type = "DISRUPTION"
-            uld_no = offload.uld_no
-            # Find AWB for this ULD
-            manifest = db.query(models.AwbUldFlight).filter(models.AwbUldFlight.uld_uld_no == uld_no).first()
-            awb_no = manifest.awb_awb_no if manifest else "UNKNOWN"
-    else:
-        if '-' in work_item_id:
-            awb_no, uld_no = work_item_id.rsplit('-', 1)
-            pred = db.query(models.AwbUldFlight).filter(
-                models.AwbUldFlight.awb_awb_no == awb_no,
-                models.AwbUldFlight.uld_uld_no == uld_no
-            ).first()
-            if not pred or not pred.offload_probability or float(pred.offload_probability) < 0.80:
-                raise HTTPException(status_code=404, detail="Predicted offload work item not found or below threshold")
-            item_type = "PREDICTED_OFFLOAD"
+    if not work_item_id.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid ID format.")
+        
+    offload = db.query(models.Offload).filter(models.Offload.offload_id == int(work_item_id)).first()
+    if not offload:
+        raise HTTPException(status_code=404, detail="Work item not found")
+        
+    if offload.source_type == 'Displaced':
+        raise HTTPException(status_code=400, detail="Pool ULDs do not get routing options.")
 
-    if not item_type:
-        raise HTTPException(status_code=400, detail="Invalid work item format")
+    existing_plans = db.query(models.RecoveryPlan).filter(
+        models.RecoveryPlan.offload_id == offload.offload_id
+    ).order_by(models.RecoveryPlan.feasibility_score.desc()).all()
 
-    all_options = _generate_mock_options(uld_no or "UNKNOWN")
-    # 3. Calculate Best Options
-    # Contract: Feasible option IDs with the lowest totalModeledExpectedLoss
-    feasible_options = [o for o in all_options if o.feasibility_status == "Feasible"]
-    
+    if not existing_plans:
+        existing_plans = _generate_real_plans(db, offload)
+
+    if not existing_plans:
+        raise HTTPException(status_code=404, detail="No recovery options found before the contractual deadline.")
+
+    formatted_options = []
     best_options = []
-    if feasible_options:
-        min_loss = min(o.total_modeled_expected_loss for o in feasible_options)
-        best_options = [o.option_id for o in feasible_options if o.total_modeled_expected_loss == min_loss]
+    min_loss = float('inf')
 
-    # 4. Return Response
+    for plan in existing_plans:
+        if plan.status == 'Discarded':
+            continue
+            
+        flight = db.query(models.Flight).filter(models.Flight.flight_id == plan.proposed_flight_id).first()
+        if not flight:
+            continue
+            
+        loss = float(plan.total_modeled_expected_loss or 0)
+        cost_breakdown = schemas.CostBreakdown(
+            cargo_customer_impact=loss * 0.8,
+            cathay_contribution_impact=loss * 0.2,
+            recovery_and_handling_cost=1000.0,
+            delay_and_service_impact=0.0,
+            downstream_network_impact=0.0,
+            total_modeled_expected_loss=loss,
+            currency="HKD"
+        )
+
+        formatted_options.append(schemas.RoutingOption(
+            option_id=str(plan.plan_id),
+            option_type="rebook" if plan.plan_type == 'IDLE_SPACE' else "split",
+            recovery_legs=[
+                schemas.RecoveryLegInfo(**{"from": flight.origin or "UNK", "to": flight.dest or "UNK", "operating_flight_id": flight.flight_id})
+            ],
+            feasibility_status="Feasible",
+            feasibility_percentage=int(plan.feasibility_score or 0),
+            usable_capacity_kg=float(flight.usable_capacity_kg or 0),
+            capacity_status="Confirmed",
+            fuel_constraint="None",
+            weather_exposure="Low",
+            expected_arrival=flight.std.isoformat() + "Z" if flight.std else "",
+            expected_delay_minutes=plan.expected_delay_minutes or 0,
+            recovery_handling_cost=1000.0,
+            total_modeled_expected_loss=loss,
+            cost_breakdown=cost_breakdown,
+            missing_data=[],
+            network_impact=plan.notes or ""
+        ))
+
+        if plan.status == 'Pending' and loss < min_loss:
+            min_loss = loss
+            best_options = [str(plan.plan_id)]
+
     return {
         "work_item_id": work_item_id,
-        "type": item_type,
+        "type": "DISRUPTION",
         "best_options": best_options,
-        "options": all_options,
+        "options": formatted_options,
         "currency": "HKD"
     }
 
 @router.get("/api/v1/recovery-solutions/{work_item_id}/options/{option_id}", response_model=schemas.OptionDetailResponse)
 def get_option_detail(work_item_id: str, option_id: str, db: Session = Depends(get_db)):
-    
-    # 1. Validate Work Item & Extract References
-    uld_no = "UNKNOWN"
-    awb_no = "UNKNOWN"
-    awb_obj = None
-    
-    if work_item_id.isdigit():
-        offload = db.query(models.Offload).filter(models.Offload.offload_id == int(work_item_id)).first()
-        if not offload:
-            raise HTTPException(status_code=404, detail="Work item not found")
-        if offload.source_type == 'Displaced':
-            raise HTTPException(status_code=400, detail="Pool ULDs do not have routing options.")
+    if not work_item_id.isdigit() or not option_id.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid ID format.")
         
-        uld_no = offload.uld_no
-        manifest = db.query(models.AwbUldFlight).filter(models.AwbUldFlight.uld_uld_no == uld_no).first()
-        if manifest:
-            awb_no = manifest.awb_awb_no
-            awb_obj = manifest.awb
-    else:
-        if '-' in work_item_id:
-            awb_no, uld_no = work_item_id.rsplit('-', 1)
-            pred = db.query(models.AwbUldFlight).filter(
-                models.AwbUldFlight.awb_awb_no == awb_no,
-                models.AwbUldFlight.uld_uld_no == uld_no
-            ).first()
-            if not pred:
-                raise HTTPException(status_code=404, detail="Prediction not found")
-            awb_obj = pred.awb
-
-    # 2. Fetch the specific option from our mock generator
-    all_options = _generate_mock_options(uld_no)
-    selected_option = next((o for o in all_options if o.option_id == option_id), None)
+    plan = db.query(models.RecoveryPlan).filter(models.RecoveryPlan.plan_id == int(option_id)).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Option not found")
+        
+    flight = db.query(models.Flight).filter(models.Flight.flight_id == plan.proposed_flight_id).first()
+    offload = db.query(models.Offload).filter(models.Offload.offload_id == int(work_item_id)).first()
     
-    if not selected_option:
-        raise HTTPException(status_code=404, detail="Option not found for this work item")
+    if not flight or not offload:
+        raise HTTPException(status_code=404, detail="Flight or Offload data missing")
 
-    # 3. Construct References (ULD & MAWB)
-    uld_info = schemas.ULDInfo(
-        uld_id=uld_no,
-        uld_type=uld_no[:3] if len(uld_no) >= 3 else "UNK", # Extract AKE/PMC
-        weight_kg=selected_option.usable_capacity_kg, # Mocking weight for reference
-        volume_m3=5.8,
-        origin="HKG", # Hardcoded mock for now
-        destination="FRA"
+    # Reconstruct RoutingOption
+    loss = float(plan.total_modeled_expected_loss or 0)
+    cost_breakdown = schemas.CostBreakdown(
+        cargo_customer_impact=loss * 0.8,
+        cathay_contribution_impact=loss * 0.2,
+        recovery_and_handling_cost=1000.0,
+        delay_and_service_impact=0.0,
+        downstream_network_impact=0.0,
+        total_modeled_expected_loss=loss,
+        currency="HKD"
+    )
+    
+    routing_option = schemas.RoutingOption(
+        option_id=str(plan.plan_id),
+        option_type="rebook" if plan.plan_type == 'IDLE_SPACE' else "split",
+        recovery_legs=[
+            schemas.RecoveryLegInfo(**{"from": flight.origin or "UNK", "to": flight.dest or "UNK", "operating_flight_id": flight.flight_id})
+        ],
+        feasibility_status="Feasible",
+        feasibility_percentage=int(plan.feasibility_score or 0),
+        usable_capacity_kg=float(flight.usable_capacity_kg or 0),
+        capacity_status="Confirmed",
+        fuel_constraint="None",
+        weather_exposure="Low",
+        expected_arrival=flight.std.isoformat() + "Z" if flight.std else "",
+        expected_delay_minutes=plan.expected_delay_minutes or 0,
+        recovery_handling_cost=1000.0,
+        total_modeled_expected_loss=loss,
+        cost_breakdown=cost_breakdown,
+        missing_data=[],
+        network_impact=plan.notes or ""
     )
 
-    mawb_info = schemas.MAWBInfo(
-        number=awb_no,
-        document_id=f"MAWB-DOC-{awb_no}",
-        display_label=f"MAWB {awb_no}"
-    )
-
-    # 4. Construct Network Domino Effect
+    # Construct detailed explanations
     domino_effect = schemas.NetworkDominoEffect(
-        affected_flights=["CX291"] if selected_option.option_type == "reroute" else [],
-        affected_uld_ids=["PMC99999CX"] if selected_option.option_type == "reroute" else [],
-        affected_shipment_ids=["SHP-1234"] if selected_option.option_type == "reroute" else [],
-        additional_capacity_shortfall_kg=500.0 if selected_option.option_type == "reroute" else 0.0,
-        summary="Displaced cargo from CX291 requires re-routing to next available flight." if selected_option.option_type == "reroute" else "No downstream impact."
+        affected_flights=[plan.proposed_flight_id],
+        affected_uld_ids=[plan.swap_uld_no] if plan.swap_uld_no else [],
+        affected_shipment_ids=[],
+        additional_capacity_shortfall_kg=0.0,
+        summary=plan.notes or "No downstream impact."
     )
 
-    # 5. Construct Scenario Sensitivity (Showing what happens if weather gets worse)
-    scenario_1 = schemas.ScenarioSensitivity(
-        input_change="Headwind increases by 20 knots",
-        feasibility_status="Infeasible",
-        cost_breakdown=schemas.CostBreakdown(
-            cargo_customer_impact=65000.0,
-            cathay_contribution_impact=0.0,
-            recovery_and_handling_cost=4760.0,
-            delay_and_service_impact=0.0,
-            downstream_network_impact=0.0,
-            total_modeled_expected_loss=69760.0,
-            currency="HKD"
-        )
-    )
-
-    # 6. Construct Explanation
     explanation = schemas.ExplanationInfo(
-        summary=f"Route via {selected_option.option_type} is currently optimal.",
-        reasons=["Lowest modeled expected loss", "Confirmed capacity at transit hub"],
-        assumptions=["Transit customs clearance takes < 2 hours", "Trucking connection at DOH is available"],
-        missing_data=selected_option.missing_data
+        summary=f"Route via {plan.plan_type} is currently optimal.",
+        reasons=["Lowest modeled expected loss" if plan.plan_type == 'IDLE_SPACE' else "Capacity available via swap"],
+        assumptions=["Station acceptance is required"],
+        missing_data=[]
     )
 
-    # 7. Return combined response
     return schemas.OptionDetailResponse(
         work_item_id=work_item_id,
-        option=selected_option,
-        uld=uld_info,
-        master_airway_bill=mawb_info,
-        cost_breakdown=selected_option.cost_breakdown,
+        option=routing_option,
+        uld=schemas.ULDInfo(
+            uld_id=offload.uld_no, uld_type="UNK", weight_kg=0.0, volume_m3=0.0, origin="HKG", destination="UNK"
+        ),
+        master_airway_bill=schemas.MAWBInfo(
+            number="UNKNOWN", document_id="UNKNOWN", display_label="UNKNOWN"
+        ), # You can expand this by fetching the actual AWB if needed
+        cost_breakdown=cost_breakdown,
         network_domino_effect=domino_effect,
-        scenario_sensitivity=[scenario_1],
+        scenario_sensitivity=[],
         explanation=explanation
     )
+
 # --- ENDPOINT 5: CONFIRM OFFLOAD ---
 @router.post("/api/v1/recovery-solutions/{work_item_id}/offload-confirmations", response_model=schemas.WorkItem)
 def confirm_offload(
@@ -718,7 +684,7 @@ def confirm_offload(
     ).first()
     
     if existing_event_offload:
-        return _map_offload_to_work_item(existing_event_offload, "DISRUPTION")
+        return _map_offload_to_work_item(db, existing_event_offload)
 
     # 3. Validation: Work Item Type
     # This endpoint only transitions PREDICTED_OFFLOAD. 
@@ -792,7 +758,7 @@ def confirm_offload(
         db.refresh(offload)
 
         # 7. Return the updated work item (now a DISRUPTION)
-        return _map_offload_to_work_item(offload, "DISRUPTION")
+        return _map_offload_to_work_item(db, offload)
 
     except Exception as e:
         db.rollback()

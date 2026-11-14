@@ -365,6 +365,10 @@ class RecoveryPlan(Base):
     estimated_priority_score: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(4, 2))
     swap_uld_no: Mapped[Optional[str]] = mapped_column(String(12))
     swap_original_flight_id: Mapped[Optional[str]] = mapped_column(String(50))
+    feasibility_score: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(5, 2))
+    expected_delay_minutes: Mapped[Optional[int]] = mapped_column(Integer)
+    total_modeled_expected_loss: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(15, 2))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
 
     offload: Mapped['Offload'] = relationship('Offload', back_populates='recovery_plan')
     proposed_flight: Mapped['Flight'] = relationship('Flight', foreign_keys=[proposed_flight_id], back_populates='recovery_plan_proposed_flight')
